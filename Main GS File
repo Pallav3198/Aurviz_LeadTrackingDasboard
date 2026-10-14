@@ -1,0 +1,1134 @@
+/****************************************************************
+ * LEAD & INVESTOR TRACKER — Google Apps Script backend (Code.gs)
+ *
+ * Lives inside the Google Sheet that holds your data.
+ *  1. In the sheet: Lead Tracker menu → Run setup (or run setup() here).
+ *     Creates/updates the tabs, dropdowns, Access PIN and timers, and
+ *     migrates data from the previous version (nothing is deleted except
+ *     investor rows, which are MOVED from Leads to Investors).
+ *  2. Deploy → New deployment → Web app
+ *     (Execute as: Me, Who has access: Anyone). That URL is your link.
+ *
+ * Public visitors see only dashboard counts. Names, contact details,
+ * money figures and editing need the Access PIN (Settings tab).
+ ****************************************************************/
+
+const CONFIG = {
+  TIMEZONE: 'Asia/Kolkata',
+  CHECK_EVERY_MINUTES: 5,      // meeting / task reminder check (1, 5, 10, 15 or 30)
+  DIGEST_HOUR: 9,              // daily digest goes out between 9 and 11 am IST
+  APP_TITLE: 'Lead Tracker',
+  SCHEMA_VERSION: '2'
+};
+
+const SHEETS = {
+  LEADS: 'Leads', INVESTORS: 'Investors', TASKS: 'Tasks', ACTIVITIES: 'Activities',
+  TEAM: 'Team', SETTINGS: 'Settings', LOG: 'Reminder Log'
+};
+
+const REMINDER_OFFSETS = [            // largest first — order matters
+  { key: '12h', label: '12 hrs', minutes: 720 },
+  { key: '6h',  label: '6 hrs',  minutes: 360 },
+  { key: '3h',  label: '3 hrs',  minutes: 180 },
+  { key: '2h',  label: '2 hrs',  minutes: 120 },
+  { key: '1h',  label: '1 hr',   minutes: 60 },
+  { key: '30m', label: '30 min', minutes: 30 },
+  { key: '15m', label: '15 min', minutes: 15 }
+];
+
+const SALES_STAGES = ['New', 'Contacted', 'Qualified', 'Meeting / Demo', 'Proposal / Pre-order', 'Won', 'Lost'];
+const INVESTOR_STAGES = ['Researching', 'Outreach', 'First Meeting', 'Follow-up', 'Due Diligence',
+                         'Term Sheet / Soft Commit', 'Committed', 'Passed'];
+
+const OPT = {
+  priority: ['High', 'Medium', 'Low'],
+  preferredContact: ['Phone', 'WhatsApp', 'Email', 'LinkedIn'],
+  type: ['B2B', 'D2C', 'Others'],
+  product: ['NeuroDrishti', 'Aurviz', 'Both'],
+  segment: ['Hospital', 'Clinic', 'Individual doctor', 'Pharma', 'Diagnostics', 'Distributor', 'Healthtech', 'Other'],
+  lostReason: ['No budget', 'No need', 'Went with competitor', 'No response', 'Bad timing', 'Other'],
+  investorType: ['Angel', 'VC fund', 'Accelerator / Incubator', 'Corporate VC', 'Family office', 'Govt / Grant', 'Strategic', 'Other'],
+  stageFocus: ['Pre-seed', 'Seed', 'Pre-Series A', 'Series A', 'Series B+', 'Any'],
+  tier: ['A', 'B', 'C'],
+  yesNo: ['No', 'Yes'],
+  dataRoom: ['No', 'Requested', 'Shared'],
+  activityType: ['Call', 'Meeting', 'Email', 'WhatsApp', 'LinkedIn', 'Note'],
+  source: ['HemeNext Conference', 'LinkedIn', 'Referral', 'Event', 'Website', 'Cold outreach', 'Inbound', 'WhatsApp']
+};
+
+const SEC = {
+  CONTACT: 'Contact', CLASS: 'Classification', PROFILE: 'Investor profile',
+  PIPE: 'Pipeline', MEET: 'Meetings & notes', REM: 'Reminder emails'
+};
+
+/* ---------------- Field definitions ----------------
+ * k = key in code, label = shown in app, h = column header in the sheet. */
+function f_(k, label, type, sec, extra) {
+  return Object.assign({ k: k, label: label, h: label, type: type, sec: sec || '' }, extra || {});
+}
+
+function contactFields_(orgLabel) {
+  return [
+    f_('name', 'Name', 'text', SEC.CONTACT, { req: true }),
+    f_('title', 'Designation', 'text', SEC.CONTACT),
+    f_('organization', orgLabel, 'text', SEC.CONTACT, { h: 'Organization' }),
+    f_('email', 'Email', 'email', SEC.CONTACT),
+    f_('altEmail', 'Alternate Email', 'email', SEC.CONTACT),
+    f_('phone', 'Phone', 'tel', SEC.CONTACT, { ph: '+91 …' }),
+    f_('whatsapp', 'WhatsApp (if different)', 'tel', SEC.CONTACT, { h: 'WhatsApp' }),
+    f_('linkedin', 'LinkedIn', 'url', SEC.CONTACT, { ph: 'linkedin.com/in/…' }),
+    f_('website', 'Website', 'url', SEC.CONTACT),
+    f_('city', 'City', 'text', SEC.CONTACT),
+    f_('country', 'Country', 'text', SEC.CONTACT),
+    f_('preferredContact', 'Preferred Contact', 'select', SEC.CONTACT, { opts: OPT.preferredContact, full: true })
+  ];
+}
+
+function meetingFields_() {
+  return [
+    f_('lastMeeting', 'Last Contact', 'datetime', SEC.MEET),
+    f_('nextMeeting', 'Next Meeting', 'datetime', SEC.MEET),
+    f_('meetingLink', 'Meeting Link / Venue', 'text', SEC.MEET, { full: true }),
+    f_('summary', 'Previous Discussion Summary', 'textarea', SEC.MEET),
+    f_('remarks', 'Remarks', 'textarea', SEC.MEET)
+  ];
+}
+
+function reminderFields_(remindHeader) {
+  return [
+    f_('reminderTimes', 'Send a reminder before the next meeting', 'reminders', SEC.REM, { h: 'Reminder Times' }),
+    f_('recipients', 'Send to', 'team-multi', SEC.REM, { h: 'Reminder Recipients' }),
+    f_('remindContact', 'Also send a short reminder to the contact (without your notes)', 'checkbox', SEC.REM, { h: remindHeader })
+  ];
+}
+
+function systemFields_() {
+  return [
+    f_('remindersSent', 'Reminders Sent', 'hidden'),
+    f_('stageChangedAt', 'Stage Changed At', 'hidden-date'),
+    f_('createdAt', 'Created At', 'hidden-date'),
+    f_('updatedAt', 'Updated At', 'hidden-date')
+  ];
+}
+
+const LEAD_FIELDS = [f_('id', 'ID', 'hidden')].concat(contactFields_('Organization'), [
+  f_('type', 'Type', 'select', SEC.CLASS, { opts: OPT.type }),
+  f_('product', 'Product', 'select', SEC.CLASS, { opts: OPT.product }),
+  f_('segment', 'Segment', 'select', SEC.CLASS, { opts: OPT.segment }),
+  f_('source', 'Lead Source', 'text', SEC.CLASS, { list: OPT.source }),
+  f_('sourceDetail', 'Source Detail', 'text', SEC.CLASS, { ph: 'Event name, who referred…' }),
+  f_('tags', 'Tags', 'text', SEC.CLASS, { ph: 'comma separated' }),
+  f_('stage', 'Stage', 'select', SEC.PIPE, { opts: SALES_STAGES }),
+  f_('priority', 'Priority', 'select', SEC.PIPE, { opts: OPT.priority }),
+  f_('owner', 'Owner', 'team', SEC.PIPE),
+  f_('expectedClose', 'Expected Close', 'date', SEC.PIPE),
+  f_('dealValue', 'Deal Value (₹)', 'number', SEC.PIPE),
+  f_('quantity', 'Units / Qty', 'number', SEC.PIPE),
+  f_('nextStep', 'Next Step', 'text', SEC.PIPE, { full: true }),
+  f_('lostReason', 'Lost Reason', 'select', SEC.PIPE, { opts: OPT.lostReason, showIf: ['stage', 'Lost'] })
+], meetingFields_(), reminderFields_('Remind Lead Too'), systemFields_());
+
+const INVESTOR_FIELDS = [f_('id', 'ID', 'hidden')].concat(contactFields_('Firm / Fund'), [
+  f_('investorType', 'Investor Type', 'select', SEC.PROFILE, { opts: OPT.investorType }),
+  f_('stageFocus', 'Stage Focus', 'select', SEC.PROFILE, { opts: OPT.stageFocus }),
+  f_('chequeSize', 'Cheque Size', 'text', SEC.PROFILE, { ph: 'e.g. ₹25L – ₹1Cr' }),
+  f_('tier', 'Tier', 'select', SEC.PROFILE, { opts: OPT.tier, help: 'A = best fit' }),
+  f_('sectorFocus', 'Thesis / Sector Focus', 'text', SEC.PROFILE, { full: true }),
+  f_('portfolio', 'Relevant Portfolio', 'text', SEC.PROFILE, { full: true }),
+  f_('product', 'Raising For', 'select', SEC.PROFILE, { opts: OPT.product }),
+  f_('warmIntro', 'Warm Intro Via', 'text', SEC.PROFILE),
+  f_('source', 'Source', 'text', SEC.PROFILE, { list: OPT.source }),
+  f_('stage', 'Stage', 'select', SEC.PIPE, { opts: INVESTOR_STAGES }),
+  f_('priority', 'Priority', 'select', SEC.PIPE, { opts: OPT.priority }),
+  f_('owner', 'Owner', 'team', SEC.PIPE),
+  f_('deckShared', 'Deck Shared', 'select', SEC.PIPE, { opts: OPT.yesNo }),
+  f_('deckSharedOn', 'Deck Shared On', 'date', SEC.PIPE),
+  f_('dataRoom', 'Data Room', 'select', SEC.PIPE, { opts: OPT.dataRoom }),
+  f_('amountDiscussed', 'Amount Discussed (₹)', 'number', SEC.PIPE),
+  f_('amountCommitted', 'Amount Committed (₹)', 'number', SEC.PIPE),
+  f_('nextStep', 'Next Step', 'text', SEC.PIPE, { full: true }),
+  f_('passReason', 'Pass Reason', 'text', SEC.PIPE, { showIf: ['stage', 'Passed'] }),
+  f_('revisitOn', 'Revisit On', 'date', SEC.PIPE, { showIf: ['stage', 'Passed'] })
+], meetingFields_(), reminderFields_('Remind Contact Too'), systemFields_());
+
+const TASK_FIELDS = [
+  f_('id', 'ID', 'hidden'),
+  f_('title', 'Task', 'text'),
+  f_('due', 'Due', 'datetime'),
+  f_('owner', 'Owner', 'text'),
+  f_('status', 'Status', 'text'),
+  f_('recordName', 'Related To', 'text'),
+  f_('kind', 'Related Type', 'text'),
+  f_('recordId', 'Related ID', 'text'),
+  f_('notes', 'Notes', 'text'),
+  f_('remindedAt', 'Reminded At', 'hidden-date'),
+  f_('createdAt', 'Created At', 'hidden-date'),
+  f_('completedAt', 'Completed At', 'hidden-date')
+];
+
+const ACTIVITY_FIELDS = [
+  f_('id', 'ID', 'hidden'),
+  f_('date', 'Date', 'datetime'),
+  f_('recordName', 'Related To', 'text'),
+  f_('type', 'Activity', 'text'),
+  f_('summary', 'Summary', 'text'),
+  f_('by', 'By', 'text'),
+  f_('kind', 'Related Type', 'text'),
+  f_('recordId', 'Related ID', 'text'),
+  f_('createdAt', 'Created At', 'hidden-date')
+];
+
+const ENTITIES = {
+  lead: { label: 'Lead', sheet: SHEETS.LEADS, fields: LEAD_FIELDS, stages: SALES_STAGES, closed: ['Won', 'Lost'] },
+  investor: { label: 'Investor', sheet: SHEETS.INVESTORS, fields: INVESTOR_FIELDS, stages: INVESTOR_STAGES, closed: ['Committed', 'Passed'] }
+};
+
+const SETTINGS_DEFAULTS = [
+  ['Email sender name', CONFIG.APP_TITLE],
+  ['Fundraise target (₹)', ''],
+  ['Stale after (days)', '14']
+];
+
+/* ================================================================
+ * Web app + sheet menu
+ * ================================================================ */
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle(CONFIG.APP_TITLE)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Lead Tracker')
+    .addItem('Run setup', 'setupFromMenu')
+    .addItem('Show access PIN', 'showPinFromMenu')
+    .addItem('Send daily digest now', 'digestFromMenu')
+    .addToUi();
+}
+
+function setupFromMenu() {
+  const moved = setup();
+  SpreadsheetApp.getUi().alert('Setup complete.\n\nYour Access PIN: ' + getSetting_('Access PIN') +
+    (moved ? '\n\nMoved ' + moved + ' investor(s) from Leads to the Investors tab.' : '') +
+    '\n\nAfter changing the code, remember: Deploy → Manage deployments → Edit → New version.');
+}
+
+function showPinFromMenu() {
+  SpreadsheetApp.getUi().alert('Access PIN: ' + (getSetting_('Access PIN') || '(not set — run setup)'));
+}
+
+function digestFromMenu() {
+  SpreadsheetApp.getUi().alert(sendDigest_(true));
+}
+
+/* ================================================================
+ * Setup & migration
+ * ================================================================ */
+function setup() {
+  const moved = withLock_(() => ensureStructure_());
+  PropertiesService.getScriptProperties().setProperty('schema', CONFIG.SCHEMA_VERSION);
+
+  ScriptApp.getProjectTriggers()
+    .filter(t => ['checkReminders', 'hourlyJobs'].indexOf(t.getHandlerFunction()) !== -1)
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('checkReminders').timeBased().everyMinutes(CONFIG.CHECK_EVERY_MINUTES).create();
+  ScriptApp.newTrigger('hourlyJobs').timeBased().everyHours(1).create();
+
+  Logger.log('Setup complete. Access PIN: ' + getSetting_('Access PIN'));
+  return moved;
+}
+
+function ensureStructureIfNeeded_() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('schema') === CONFIG.SCHEMA_VERSION) return;
+  withLock_(() => ensureStructure_());
+  props.setProperty('schema', CONFIG.SCHEMA_VERSION);
+}
+
+function ensureStructure_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.setSpreadsheetTimeZone(CONFIG.TIMEZONE);
+
+  const oldLeads = ss.getSheetByName(SHEETS.LEADS);
+  if (oldLeads) {
+    // Version 1 → 2 column renames
+    renameHeader_(oldLeads, 'Company', 'Product');
+    renameHeader_(oldLeads, 'Last Meeting', 'Last Contact');
+  } else {
+    const sheets = ss.getSheets();
+    if (sheets.length === 1 && sheets[0].getLastRow() === 0) sheets[0].setName(SHEETS.LEADS);
+  }
+
+  const leads = ensureSheet_(ss, SHEETS.LEADS, LEAD_FIELDS.map(x => x.h));
+  const invs = ensureSheet_(ss, SHEETS.INVESTORS, INVESTOR_FIELDS.map(x => x.h));
+  const tasks = ensureSheet_(ss, SHEETS.TASKS, TASK_FIELDS.map(x => x.h));
+  const acts = ensureSheet_(ss, SHEETS.ACTIVITIES, ACTIVITY_FIELDS.map(x => x.h));
+
+  const team = ensureSheet_(ss, SHEETS.TEAM, ['Name', 'Email', 'Daily Digest']);
+  if (team.getLastRow() < 2) team.appendRow(['Me', Session.getEffectiveUser().getEmail(), 'Yes']);
+
+  const settings = ensureSheet_(ss, SHEETS.SETTINGS, ['Setting', 'Value']);
+  if (!getSetting_('Access PIN')) settings.appendRow(['Access PIN', String(Math.floor(100000 + Math.random() * 900000))]);
+  SETTINGS_DEFAULTS.forEach(([k, v]) => { if (!hasSetting_(k)) settings.appendRow([k, v]); });
+
+  ensureSheet_(ss, SHEETS.LOG, ['Sent At', 'To', 'Related To', 'Reminder', 'Status']);
+
+  const moved = migrateInvestorsFromLeads_();
+  fillDefaults_();
+
+  applyFormats_(leads, LEAD_FIELDS);
+  applyFormats_(invs, INVESTOR_FIELDS);
+  applyFormats_(tasks, TASK_FIELDS);
+  applyFormats_(acts, ACTIVITY_FIELDS);
+  setDropdown_(tasks, headerIndex_(headerRow_(tasks))['Status'], ['Open', 'Done']);
+  return moved;
+}
+
+function renameHeader_(sh, from, to) {
+  const header = headerRow_(sh);
+  const i = header.indexOf(from);
+  if (i !== -1 && header.indexOf(to) === -1) sh.getRange(1, i + 1).setValue(to);
+}
+
+// Version 1 had a "Potential Investor" Yes/No column. Those rows move to Investors.
+function migrateInvestorsFromLeads_() {
+  const sh = sheet_(SHEETS.LEADS);
+  const col = headerRow_(sh).indexOf('Potential Investor');
+  if (col === -1) return 0;
+  const values = sh.getDataRange().getValues();
+  const yes = readTable_(SHEETS.LEADS, LEAD_FIELDS)
+    .filter(r => String(values[r._row - 1][col]).trim().toLowerCase() === 'yes');
+  if (!yes.length) return 0;
+
+  const existing = readTable_(SHEETS.INVESTORS, INVESTOR_FIELDS).map(r => String(r.id));
+  yes.forEach(r => {
+    if (existing.indexOf(String(r.id)) !== -1) return;
+    const rec = {};
+    INVESTOR_FIELDS.forEach(fd => { if (r[fd.k] !== undefined && r[fd.k] !== '') rec[fd.k] = r[fd.k]; });
+    rec.stage = 'Outreach';
+    rec.stageChangedAt = new Date();
+    rec.updatedAt = new Date();
+    writeRow_(SHEETS.INVESTORS, INVESTOR_FIELDS, rec, null);
+    addActivity_('investor', rec.id, rec.name, new Date(), 'Note', 'Moved from Leads to Investors', '');
+  });
+  yes.sort((a, b) => b._row - a._row).forEach(r => sh.deleteRow(r._row));
+  return yes.length;
+}
+
+function fillDefaults_() {
+  Object.keys(ENTITIES).forEach(kind => {
+    const ent = ENTITIES[kind];
+    readTable_(ent.sheet, ent.fields).forEach(r => {
+      const upd = {};
+      if (!String(r.stage).trim()) upd.stage = ent.stages[0];
+      if (!String(r.priority).trim()) upd.priority = 'Medium';
+      if (!asDate_(r.createdAt)) upd.createdAt = new Date();
+      if (Object.keys(upd).length) writeRow_(ent.sheet, ent.fields, upd, r._row);
+    });
+  });
+}
+
+function applyFormats_(sh, fields) {
+  const idx = headerIndex_(headerRow_(sh));
+  const rows = sh.getMaxRows() - 1;
+  if (rows < 1) return;
+  fields.forEach(fd => {
+    const c = idx[fd.h];
+    if (c === undefined) return;
+    const rng = sh.getRange(2, c + 1, rows, 1);
+    if (fd.type === 'select') setDropdown_(sh, c, fd.opts);
+    else if (fd.type === 'date') rng.setNumberFormat('d mmm yyyy');
+    else if (fd.type === 'datetime' || fd.type === 'hidden-date') rng.setNumberFormat('d mmm yyyy, h:mm am/pm');
+    else if (fd.type === 'tel') rng.setNumberFormat('@');
+    else if (fd.type === 'number') rng.setNumberFormat('#,##0');
+    else if (fd.type === 'checkbox') setDropdown_(sh, c, ['Yes', 'No']);
+  });
+}
+
+/* ================================================================
+ * Read-only endpoints
+ * ================================================================ */
+function verifyPin(pin) {
+  try { checkPin_(pin); return true; } catch (e) { return false; }
+}
+
+function getAppData(pin) {
+  checkPin_(pin);
+  ensureStructureIfNeeded_();
+  return appData_();
+}
+
+function appData_() {
+  const out = {
+    schema: { lead: schemaOut_('lead'), investor: schemaOut_('investor') },
+    offsets: REMINDER_OFFSETS.map(o => ({ key: o.key, label: o.label, minutes: o.minutes })),
+    activityTypes: OPT.activityType,
+    team: teamList_().map(t => t.name),
+    staleDays: staleDays_(),
+    tasks: readTable_(SHEETS.TASKS, TASK_FIELDS).map(r => toClient_(TASK_FIELDS, r)),
+    activities: readTable_(SHEETS.ACTIVITIES, ACTIVITY_FIELDS).map(r => toClient_(ACTIVITY_FIELDS, r))
+  };
+  Object.keys(ENTITIES).forEach(kind => {
+    const ent = ENTITIES[kind];
+    out[kind] = readTable_(ent.sheet, ent.fields).map(r => toClient_(ent.fields, r));
+  });
+  return out;
+}
+
+function schemaOut_(kind) {
+  const e = ENTITIES[kind];
+  return {
+    label: e.label, stages: e.stages, closed: e.closed,
+    fields: e.fields.filter(fd => fd.type.indexOf('hidden') !== 0).map(fd => ({
+      k: fd.k, label: fd.label, type: fd.type, sec: fd.sec, opts: fd.opts || null, req: !!fd.req,
+      full: !!fd.full, ph: fd.ph || '', list: fd.list || null, showIf: fd.showIf || null, help: fd.help || ''
+    }))
+  };
+}
+
+function getDashboard(pin) {
+  ensureStructureIfNeeded_();
+  const unlocked = pin ? verifyPin(pin) : false;
+  const now = Date.now(), DAY = 864e5;
+  const today = ymd_(new Date());
+  const leads = readTable_(SHEETS.LEADS, LEAD_FIELDS);
+  const invs = readTable_(SHEETS.INVESTORS, INVESTOR_FIELDS);
+  const tasks = readTable_(SHEETS.TASKS, TASK_FIELDS);
+  const staleAfter = staleDays_();
+
+  const isOpen = (kind, r) => ENTITIES[kind].closed.indexOf(String(r.stage)) === -1;
+  const sum = (arr, k) => arr.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+  const stageCounts = (list, stages) => stages.map(s => [s, list.filter(r => String(r.stage) === s).length]);
+  const openLeads = leads.filter(r => isOpen('lead', r));
+  const openInvs = invs.filter(r => isOpen('investor', r));
+  const won = leads.filter(r => r.stage === 'Won');
+  const committed = invs.filter(r => r.stage === 'Committed');
+  const ddIdx = INVESTOR_STAGES.indexOf('Due Diligence');
+
+  const openTasks = tasks.filter(t => t.status !== 'Done');
+  const overdue = openTasks.filter(t => { const d = asDate_(t.due); return d && d.getTime() < now; });
+  const dueToday = openTasks.filter(t => { const d = asDate_(t.due); return d && d.getTime() >= now && ymd_(d) === today; });
+
+  const meetings = [];
+  [['lead', leads], ['investor', invs]].forEach(([kind, list]) => list.forEach(r => {
+    const m = asDate_(r.nextMeeting);
+    if (m && m.getTime() >= now - 3600e3 && m.getTime() - now <= 7 * DAY) {
+      meetings.push({ kind: kind, id: String(r.id), name: String(r.name), org: String(r.organization || ''),
+                      priority: String(r.priority || ''), stage: String(r.stage || ''), when: m.toISOString(),
+                      link: String(r.meetingLink || '') });
+    }
+  }));
+  meetings.sort((a, b) => a.when.localeCompare(b.when));
+
+  const rank = { High: 0, Medium: 1, Low: 2 };
+  const stale = [];
+  [['lead', openLeads], ['investor', openInvs]].forEach(([kind, list]) => list.forEach(r => {
+    const next = asDate_(r.nextMeeting);
+    if (next && next.getTime() > now) return;
+    const last = asDate_(r.lastMeeting) || asDate_(r.createdAt);
+    const days = last ? Math.floor((now - last.getTime()) / DAY) : 999;
+    if (days >= staleAfter) {
+      stale.push({ kind: kind, id: String(r.id), name: String(r.name), org: String(r.organization || ''),
+                   priority: String(r.priority || ''), days: days, never: !asDate_(r.lastMeeting) });
+    }
+  }));
+  stale.sort((a, b) => ((rank[a.priority] ?? 3) - (rank[b.priority] ?? 3)) || (b.days - a.days));
+
+  const trend = [];
+  for (let i = 7; i >= 0; i--) {
+    const end = now - i * 7 * DAY, start = end - 7 * DAY;
+    const inWeek = r => { const c = asDate_(r.createdAt); return c && c.getTime() > start && c.getTime() <= end; };
+    trend.push({ label: Utilities.formatDate(new Date(start + DAY), CONFIG.TIMEZONE, 'd MMM'),
+                 leads: leads.filter(inWeek).length, investors: invs.filter(inWeek).length });
+  }
+
+  const target = Number(String(getSetting_('Fundraise target (₹)')).replace(/[^\d.]/g, '')) || 0;
+
+  return {
+    unlocked: unlocked,
+    appUrl: appUrl_(),
+    title: CONFIG.APP_TITLE,
+    staleDays: staleAfter,
+    sales: {
+      total: leads.length, open: openLeads.length,
+      newWeek: leads.filter(r => { const c = asDate_(r.createdAt); return c && now - c.getTime() <= 7 * DAY; }).length,
+      won: won.length, lost: leads.filter(r => r.stage === 'Lost').length,
+      meetings7: meetings.filter(m => m.kind === 'lead').length,
+      pipelineValue: unlocked ? sum(openLeads, 'dealValue') : null,
+      wonValue: unlocked ? sum(won, 'dealValue') : null,
+      stages: stageCounts(leads, SALES_STAGES),
+      type: countBy_(leads, 'type', OPT.type),
+      product: countBy_(leads, 'product', OPT.product),
+      source: countBy_(leads, 'source', []),
+      segment: countBy_(leads, 'segment', OPT.segment)
+    },
+    investors: {
+      total: invs.length, active: openInvs.length,
+      meetings7: meetings.filter(m => m.kind === 'investor').length,
+      inDD: openInvs.filter(r => INVESTOR_STAGES.indexOf(String(r.stage)) >= ddIdx).length,
+      committed: committed.length,
+      committedAmount: unlocked ? sum(committed, 'amountCommitted') : null,
+      target: unlocked ? target : null,
+      stages: stageCounts(invs, INVESTOR_STAGES),
+      type: countBy_(invs, 'investorType', OPT.investorType),
+      tier: countBy_(invs, 'tier', OPT.tier)
+    },
+    tasks: { overdue: overdue.length, today: dueToday.length },
+    trend: trend,
+    agenda: unlocked ? meetings.slice(0, 15) : null,
+    dueTasks: unlocked ? overdue.concat(dueToday).map(t => toClient_(TASK_FIELDS, t)).slice(0, 15) : null,
+    stale: unlocked ? stale.slice(0, 12) : null
+  };
+}
+
+/* ================================================================
+ * Write endpoints — every one returns fresh app data
+ * ================================================================ */
+function saveRecord(pin, kind, input) {
+  checkPin_(pin);
+  const ent = entity_(kind);
+  if (!input || !String(input.name || '').trim()) throw new Error('Name is required.');
+  return withLock_(() => {
+    const existing = input.id ? findRecord_(kind, input.id) : null;
+    if (input.id && !existing) throw new Error('This record no longer exists. Refresh the page.');
+    const now = new Date();
+    const rec = fromClient_(ent.fields, input);
+    rec.id = existing ? existing.id : newId_();
+    if (ent.stages.indexOf(rec.stage) === -1) rec.stage = existing && existing.stage ? existing.stage : ent.stages[0];
+    if (!rec.priority) rec.priority = 'Medium';
+    const oldStage = existing ? String(existing.stage || '') : '';
+    if (!existing || oldStage !== rec.stage) rec.stageChangedAt = now;
+
+    const oldNext = existing ? asDate_(existing.nextMeeting) : null;
+    const newNext = asDate_(rec.nextMeeting);
+    if (!(oldNext && newNext && oldNext.getTime() === newNext.getTime())) rec.remindersSent = '';
+    rec.createdAt = existing ? (asDate_(existing.createdAt) || now) : now;
+    rec.updatedAt = now;
+
+    writeRow_(ent.sheet, ent.fields, rec, existing ? existing._row : null);
+    if (!existing) addActivity_(kind, rec.id, rec.name, now, 'Created', 'Added as ' + ent.label.toLowerCase() + ' · ' + rec.stage, '');
+    else if (oldStage !== rec.stage) addActivity_(kind, rec.id, rec.name, now, 'Stage change', (oldStage || '—') + ' → ' + rec.stage, '');
+    if (existing && String(existing.name) !== String(rec.name)) renameRelated_(rec.id, rec.name);
+
+    return Object.assign(appData_(), { savedId: String(rec.id) });
+  });
+}
+
+function setStage(pin, kind, id, stage) {
+  checkPin_(pin);
+  const ent = entity_(kind);
+  if (ent.stages.indexOf(stage) === -1) throw new Error('Unknown stage.');
+  return withLock_(() => {
+    const r = findRecord_(kind, id);
+    if (!r) throw new Error('Record not found.');
+    if (String(r.stage) !== stage) {
+      const now = new Date();
+      writeRow_(ent.sheet, ent.fields, { stage: stage, stageChangedAt: now, updatedAt: now }, r._row);
+      addActivity_(kind, r.id, r.name, now, 'Stage change', (r.stage || '—') + ' → ' + stage, '');
+    }
+    return appData_();
+  });
+}
+
+function deleteRecord(pin, kind, id) {
+  checkPin_(pin);
+  const ent = entity_(kind);
+  return withLock_(() => {
+    const r = findRecord_(kind, id);
+    if (!r) throw new Error('Record not found.');
+    sheet_(ent.sheet).deleteRow(r._row);
+    deleteWhere_(SHEETS.TASKS, TASK_FIELDS, t => String(t.recordId) === String(id));
+    deleteWhere_(SHEETS.ACTIVITIES, ACTIVITY_FIELDS, a => String(a.recordId) === String(id));
+    return appData_();
+  });
+}
+
+function moveLeadToInvestors(pin, id) {
+  checkPin_(pin);
+  return withLock_(() => {
+    const lead = findRecord_('lead', id);
+    if (!lead) throw new Error('Lead not found.');
+    const now = new Date();
+    const rec = {};
+    INVESTOR_FIELDS.forEach(fd => { if (lead[fd.k] !== undefined && lead[fd.k] !== '') rec[fd.k] = lead[fd.k]; });
+    rec.stage = 'Outreach';
+    rec.stageChangedAt = now;
+    rec.updatedAt = now;
+    writeRow_(SHEETS.INVESTORS, INVESTOR_FIELDS, rec, null);
+    sheet_(SHEETS.LEADS).deleteRow(lead._row);
+    updateWhere_(SHEETS.TASKS, TASK_FIELDS, t => String(t.recordId) === String(id), { kind: 'investor' });
+    updateWhere_(SHEETS.ACTIVITIES, ACTIVITY_FIELDS, a => String(a.recordId) === String(id), { kind: 'investor' });
+    addActivity_('investor', rec.id, rec.name, now, 'Note', 'Moved from Leads to Investors', '');
+    return Object.assign(appData_(), { savedId: String(rec.id) });
+  });
+}
+
+function logActivity(pin, a) {
+  checkPin_(pin);
+  const ent = entity_(a && a.kind);
+  if (!String(a.summary || '').trim()) throw new Error('Write a short summary of what happened.');
+  return withLock_(() => {
+    const r = findRecord_(a.kind, a.recordId);
+    if (!r) throw new Error('Record not found.');
+    const now = new Date();
+    const when = asDate_(a.date) || now;
+    const type = OPT.activityType.indexOf(a.type) !== -1 ? a.type : 'Note';
+    addActivity_(a.kind, r.id, r.name, when, type, a.summary, a.by);
+
+    const upd = { updatedAt: now };
+    if (type !== 'Note' && when.getTime() <= now.getTime() + 864e5) {
+      const last = asDate_(r.lastMeeting);
+      if (!last || when > last) upd.lastMeeting = when;
+      // First real touch moves a brand-new record forward automatically
+      if (String(r.stage) === ent.stages[0]) {
+        upd.stage = ent.stages[1];
+        upd.stageChangedAt = now;
+        addActivity_(a.kind, r.id, r.name, now, 'Stage change', ent.stages[0] + ' → ' + ent.stages[1], '');
+      }
+    }
+    if (String(a.nextStep || '').trim()) upd.nextStep = cleanText_(a.nextStep);
+    writeRow_(ent.sheet, ent.fields, upd, r._row);
+
+    if (a.followUp && String(a.followUp.title || '').trim()) {
+      addTask_({ title: a.followUp.title, due: a.followUp.due, owner: a.followUp.owner,
+                 kind: a.kind, recordId: r.id, recordName: r.name });
+    }
+    return appData_();
+  });
+}
+
+function deleteActivity(pin, id) {
+  checkPin_(pin);
+  return withLock_(() => {
+    deleteWhere_(SHEETS.ACTIVITIES, ACTIVITY_FIELDS, a => String(a.id) === String(id));
+    return appData_();
+  });
+}
+
+function saveTask(pin, t) {
+  checkPin_(pin);
+  if (!t || !String(t.title || '').trim()) throw new Error('Task title is required.');
+  return withLock_(() => {
+    let recordName = '';
+    if (t.kind && t.recordId) {
+      const r = findRecord_(t.kind, t.recordId);
+      if (!r) throw new Error('Related record not found.');
+      recordName = String(r.name);
+    }
+    if (t.id) {
+      const ex = readTable_(SHEETS.TASKS, TASK_FIELDS).find(x => String(x.id) === String(t.id));
+      if (!ex) throw new Error('Task not found.');
+      const upd = { title: cleanText_(t.title), due: asDate_(t.due) || '', owner: cleanText_(t.owner || ''),
+                    notes: cleanText_(t.notes || ''), kind: t.kind || '', recordId: t.recordId || '', recordName: recordName };
+      const exDue = asDate_(ex.due);
+      if (!(exDue && upd.due && exDue.getTime() === upd.due.getTime())) upd.remindedAt = '';
+      writeRow_(SHEETS.TASKS, TASK_FIELDS, upd, ex._row);
+    } else {
+      addTask_(Object.assign({}, t, { recordName: recordName }));
+    }
+    return appData_();
+  });
+}
+
+function setTaskDone(pin, id, done) {
+  checkPin_(pin);
+  return withLock_(() => {
+    updateWhere_(SHEETS.TASKS, TASK_FIELDS, t => String(t.id) === String(id),
+      { status: done ? 'Done' : 'Open', completedAt: done ? new Date() : '' });
+    return appData_();
+  });
+}
+
+function deleteTask(pin, id) {
+  checkPin_(pin);
+  return withLock_(() => {
+    deleteWhere_(SHEETS.TASKS, TASK_FIELDS, t => String(t.id) === String(id));
+    return appData_();
+  });
+}
+
+function sendReminderNow(pin, kind, id) {
+  checkPin_(pin);
+  entity_(kind);
+  const r = findRecord_(kind, id);
+  if (!r) throw new Error('Record not found. Save it first.');
+  const meeting = asDate_(r.nextMeeting);
+  const upcoming = meeting && meeting.getTime() > Date.now() ? meeting : null;
+  const to = recipientsFor_(r);
+  if (!to.team.length && !(to.contact && upcoming)) throw new Error('No recipients. Pick team members under "Send to" and save.');
+  if (to.team.length) sendTeamEmail_(kind, r, upcoming, to.team);
+  if (to.contact && upcoming) sendContactEmail_(r, upcoming, to.contact);
+  const sentTo = to.team.concat(to.contact && upcoming ? [to.contact] : []);
+  log_(sentTo, r.name, 'Manual', 'Sent');
+  return 'Reminder sent to ' + sentTo.length + ' recipient(s).';
+}
+
+/* ================================================================
+ * Timers
+ * ================================================================ */
+function checkReminders() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return;
+  try {
+    Object.keys(ENTITIES).forEach(remindEntity_);
+    remindTasks_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function remindEntity_(kind) {
+  const ent = ENTITIES[kind];
+  const sh = sheet_(ent.sheet);
+  const sentCol = headerIndex_(headerRow_(sh))['Reminders Sent'];
+  if (sentCol === undefined) return;
+  const now = Date.now();
+  readTable_(ent.sheet, ent.fields).forEach(r => {
+    const meeting = asDate_(r.nextMeeting);
+    if (!meeting || meeting.getTime() <= now) return;
+    const chosen = splitList_(r.reminderTimes);
+    if (!chosen.length) return;
+    const stamp = meeting.toISOString();
+    const sent = splitList_(r.remindersSent).filter(s => s.indexOf(stamp + '|') === 0);
+    const due = REMINDER_OFFSETS.filter(o => chosen.indexOf(o.key) !== -1 &&
+      sent.indexOf(stamp + '|' + o.key) === -1 && now >= meeting.getTime() - o.minutes * 60000);
+    if (!due.length) return;
+
+    // Several due at once (meeting booked late) → one email, mark the missed ones done
+    const current = due[due.length - 1];
+    const to = recipientsFor_(r);
+    let status = 'Sent';
+    if (!to.team.length && !to.contact) status = 'Skipped: no recipients';
+    else {
+      try {
+        if (to.team.length) sendTeamEmail_(kind, r, meeting, to.team);
+        if (to.contact) sendContactEmail_(r, meeting, to.contact);
+      } catch (e) { status = 'Error: ' + e.message; }
+    }
+    sh.getRange(r._row, sentCol + 1).setValue(sent.concat(due.map(o => stamp + '|' + o.key)).join(', '));
+    log_(to.team.concat(to.contact ? [to.contact] : []), r.name, current.label + ' before meeting', status);
+  });
+}
+
+function remindTasks_() {
+  const now = Date.now();
+  const emails = {};
+  teamList_().forEach(t => { emails[t.name.toLowerCase()] = t.email; });
+  readTable_(SHEETS.TASKS, TASK_FIELDS).forEach(t => {
+    if (t.status === 'Done' || asDate_(t.remindedAt)) return;
+    const due = asDate_(t.due);
+    if (!due || due.getTime() > now) return;
+    let status = 'Skipped: too old';
+    const to = emails[String(t.owner || '').toLowerCase()];
+    if (now - due.getTime() < 6 * 3600e3) {
+      if (!to) status = 'Skipped: task has no owner with an email';
+      else {
+        try {
+          MailApp.sendEmail({
+            to: to, name: senderName_(),
+            subject: 'Task due: ' + t.title + (t.recordName ? ' (' + t.recordName + ')' : ''),
+            htmlBody: '<div style="font-family:Arial,sans-serif;font-size:14px;color:#111827">' +
+              '<p style="font-size:16px;margin:0 0 8px"><b>' + esc_(t.title) + '</b></p>' +
+              (t.recordName ? '<p style="margin:0 0 4px">Related to: ' + esc_(t.recordName) + '</p>' : '') +
+              '<p style="margin:0 0 4px">Due: ' + esc_(fmt_(due)) + '</p>' +
+              (t.notes ? '<p>' + nl2br_(t.notes) + '</p>' : '') +
+              '<p style="margin-top:16px;font-size:12px;color:#9ca3af"><a href="' + appUrl_() + '">Open tracker</a></p></div>'
+          });
+          status = 'Sent';
+        } catch (e) { status = 'Error: ' + e.message; }
+      }
+    }
+    writeRow_(SHEETS.TASKS, TASK_FIELDS, { remindedAt: new Date() }, t._row);
+    if (status !== 'Skipped: too old') log_(to ? [to] : [], t.title, 'Task due', status);
+  });
+}
+
+function hourlyJobs() {
+  const hour = Number(Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'H'));
+  const today = ymd_(new Date());
+  const props = PropertiesService.getScriptProperties();
+  if (hour >= CONFIG.DIGEST_HOUR && hour < CONFIG.DIGEST_HOUR + 3 && props.getProperty('digestDay') !== today) {
+    props.setProperty('digestDay', today);
+    sendDigest_(false);
+  }
+}
+
+function sendDigest_(force) {
+  const subs = teamList_().filter(t => /^y/i.test(t.digest));
+  if (!subs.length) return 'No one has "Daily Digest" = Yes in the Team tab.';
+  const now = new Date(), today = ymd_(now), DAY = 864e5;
+  const staleAfter = staleDays_();
+
+  const meetings = [], stale = [];
+  Object.keys(ENTITIES).forEach(kind => {
+    const ent = ENTITIES[kind];
+    readTable_(ent.sheet, ent.fields).forEach(r => {
+      const m = asDate_(r.nextMeeting);
+      if (m && ymd_(m) === today) meetings.push({ kind: kind, r: r, m: m });
+      const open = ent.closed.indexOf(String(r.stage)) === -1;
+      const last = asDate_(r.lastMeeting) || asDate_(r.createdAt);
+      if (open && r.priority === 'High' && !(m && m > now) && last && (now - last) / DAY >= staleAfter) {
+        stale.push({ kind: kind, r: r, days: Math.floor((now - last) / DAY) });
+      }
+    });
+  });
+  meetings.sort((a, b) => a.m - b.m);
+  const tasks = readTable_(SHEETS.TASKS, TASK_FIELDS).filter(t => {
+    const d = asDate_(t.due);
+    return t.status !== 'Done' && d && ymd_(d) <= today;
+  }).sort((a, b) => asDate_(a.due) - asDate_(b.due));
+
+  if (!force && !meetings.length && !tasks.length && !stale.length) return 'Nothing to send today.';
+
+  const li = items => items.length ? '<ul style="padding-left:18px;margin:6px 0 16px">' + items.join('') + '</ul>' : '<p style="color:#6b7280;margin:6px 0 16px">None</p>';
+  const tag = kind => kind === 'investor' ? ' <span style="color:#7c3aed">[Investor]</span>' : '';
+  const html = '<div style="font-family:Arial,sans-serif;font-size:14px;color:#111827;max-width:600px">' +
+    '<h2 style="margin:0 0 4px">Good morning</h2><p style="color:#6b7280;margin:0 0 16px">' +
+    esc_(Utilities.formatDate(now, CONFIG.TIMEZONE, 'EEEE, d MMMM')) + '</p>' +
+    '<h3 style="margin:0">Meetings today (' + meetings.length + ')</h3>' +
+    li(meetings.map(x => '<li><b>' + esc_(Utilities.formatDate(x.m, CONFIG.TIMEZONE, 'h:mm a')) + '</b> — ' +
+      esc_(x.r.name) + (x.r.organization ? ', ' + esc_(x.r.organization) : '') + tag(x.kind) + '</li>')) +
+    '<h3 style="margin:0">Tasks due or overdue (' + tasks.length + ')</h3>' +
+    li(tasks.map(t => { const d = asDate_(t.due); const od = d < now && ymd_(d) !== today;
+      return '<li>' + (od ? '<span style="color:#dc2626">Overdue</span> · ' : '') + esc_(t.title) +
+        (t.recordName ? ' — ' + esc_(t.recordName) : '') + (t.owner ? ' <span style="color:#6b7280">(' + esc_(t.owner) + ')</span>' : '') + '</li>'; })) +
+    '<h3 style="margin:0">High-priority, no contact in ' + staleAfter + '+ days (' + stale.length + ')</h3>' +
+    li(stale.slice(0, 10).map(x => '<li>' + esc_(x.r.name) + (x.r.organization ? ', ' + esc_(x.r.organization) : '') +
+      tag(x.kind) + ' — ' + x.days + ' days</li>')) +
+    '<p style="font-size:12px;color:#9ca3af"><a href="' + appUrl_() + '">Open tracker</a> · To stop these, set Daily Digest to No in the Team tab.</p></div>';
+
+  MailApp.sendEmail({
+    to: subs.map(s => s.email).join(','), name: senderName_(), htmlBody: html,
+    subject: 'Today: ' + meetings.length + ' meeting(s), ' + tasks.length + ' task(s) due'
+  });
+  log_(subs.map(s => s.email), 'Daily digest', 'Digest', 'Sent');
+  return 'Digest sent to ' + subs.length + ' person(s).';
+}
+
+/* ================================================================
+ * Emails
+ * ================================================================ */
+function sendTeamEmail_(kind, r, meeting, to) {
+  const subject = meeting
+    ? 'Reminder: ' + r.name + ' — meeting ' + inWords_(meeting) + ' (' + Utilities.formatDate(meeting, CONFIG.TIMEZONE, 'h:mm a') + ')'
+    : 'Follow-up reminder: ' + r.name;
+  const digits = waDigits_(r.whatsapp || r.phone);
+  const row = (k, v) => v ? '<tr><td style="padding:5px 12px 5px 0;color:#6b7280;vertical-align:top;white-space:nowrap">' + k +
+    '</td><td style="padding:5px 0;color:#111827">' + v + '</td></tr>' : '';
+  const d = v => asDate_(v) ? esc_(fmt_(asDate_(v))) : '';
+  const money = v => Number(v) ? '₹' + Number(v).toLocaleString('en-IN') : '';
+
+  let rows = row(kind === 'investor' ? 'Firm / Fund' : 'Organization', esc_(r.organization)) +
+    row('Designation', esc_(r.title)) + row('Stage', esc_(r.stage)) + row('Priority', esc_(r.priority));
+  if (kind === 'investor') {
+    rows += row('Investor type', esc_(r.investorType)) + row('Cheque size', esc_(r.chequeSize)) +
+      row('Tier', esc_(r.tier)) + row('Deck shared', esc_(r.deckShared)) + row('Warm intro via', esc_(r.warmIntro)) +
+      row('Amount discussed', money(r.amountDiscussed));
+  } else {
+    rows += row('Type', esc_(r.type)) + row('Product', esc_(r.product)) + row('Deal value', money(r.dealValue));
+  }
+  rows += row('Preferred contact', esc_(r.preferredContact)) +
+    row('Email', r.email ? '<a href="mailto:' + esc_(r.email) + '">' + esc_(r.email) + '</a>' : '') +
+    row('Phone', r.phone ? '<a href="tel:' + esc_(r.phone) + '">' + esc_(r.phone) + '</a>' +
+      (digits ? ' · <a href="https://wa.me/' + digits + '">WhatsApp</a>' : '') : '') +
+    row('LinkedIn', r.linkedin ? '<a href="' + esc_(normalizeUrl_(r.linkedin)) + '">View profile</a>' : '') +
+    row('Meeting link / venue', esc_(r.meetingLink)) + row('Next step', esc_(r.nextStep)) +
+    row('Last contact', d(r.lastMeeting)) + row('Previous discussion', nl2br_(r.summary)) + row('Remarks', nl2br_(r.remarks));
+
+  const recent = activitiesFor_(r.id).filter(a => a.type !== 'Created').slice(0, 3);
+  const recentHtml = recent.length ? '<h3 style="font-size:14px;margin:18px 0 6px">Recent activity</h3><ul style="padding-left:18px;margin:0">' +
+    recent.map(a => '<li style="margin-bottom:4px"><b>' + esc_(a.type) + '</b> · ' + d(a.date) + ' — ' + esc_(a.summary) + '</li>').join('') + '</ul>' : '';
+
+  const html = '<div style="font-family:Arial,sans-serif;max-width:580px">' +
+    '<h2 style="margin:0 0 4px;color:#111827">' + esc_(r.name) + (kind === 'investor' ? ' <span style="font-size:13px;color:#7c3aed">Investor</span>' : '') + '</h2>' +
+    '<p style="margin:0 0 16px;color:#2563eb;font-weight:bold">' + (meeting ? 'Meeting ' + esc_(inWords_(meeting)) + ' · ' + esc_(fmt_(meeting)) : 'No upcoming meeting set') + '</p>' +
+    '<table style="border-collapse:collapse;font-size:14px">' + rows + '</table>' + recentHtml +
+    '<p style="margin-top:20px;font-size:12px;color:#9ca3af">Sent by ' + esc_(senderName_()) + ' · <a href="' + appUrl_() + '">Open tracker</a></p></div>';
+  MailApp.sendEmail({ to: to.join(','), subject: subject, htmlBody: html, name: senderName_() });
+}
+
+// The contact gets a short polite note — never your internal notes.
+function sendContactEmail_(r, meeting, to) {
+  const first = String(r.name || '').replace(/^(dr\.?|mr\.?|ms\.?|mrs\.?)\s+/i, '').split(' ')[0] || 'there';
+  const salutation = /^dr\.?\s/i.test(String(r.name)) ? 'Dr. ' + first : first;
+  const html = '<div style="font-family:Arial,sans-serif;font-size:14px;color:#111827">' +
+    '<p>Hi ' + esc_(salutation) + ',</p>' +
+    '<p>A quick reminder of our meeting on <b>' + esc_(fmt_(meeting)) + '</b> (' + esc_(inWords_(meeting)) + ').' +
+    (r.meetingLink ? '<br>Link / venue: ' + esc_(r.meetingLink) : '') + '</p>' +
+    '<p>Looking forward to speaking with you.</p>' +
+    '<p>Best regards,<br>' + esc_(senderName_()) + '</p></div>';
+  MailApp.sendEmail({ to: to, subject: 'Reminder: our meeting ' + inWords_(meeting), htmlBody: html, name: senderName_() });
+}
+
+/* ================================================================
+ * Sheet helpers
+ * ================================================================ */
+function readTable_(sheetName, fields) {
+  const sh = sheet_(sheetName);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const idx = headerIndex_(values[0].map(h => String(h).trim()));
+  const out = [], missingId = [];
+  values.slice(1).forEach((row, i) => {
+    const o = { _row: i + 2 };
+    fields.forEach(fd => { o[fd.k] = idx[fd.h] === undefined ? '' : row[idx[fd.h]]; });
+    const hasId = String(o.id || '').trim() !== '';
+    if (!hasId && !String(o.name || o.title || o.summary || '').trim()) return;   // blank row
+    if (!hasId) { o.id = newId_(); missingId.push(o); }                          // typed directly into the sheet
+    out.push(o);
+  });
+  if (missingId.length && idx['ID'] !== undefined) {
+    missingId.forEach(o => sh.getRange(o._row, idx['ID'] + 1).setValue(o.id));
+  }
+  return out;
+}
+
+// rec values that are undefined leave the cell unchanged (partial updates)
+function writeRow_(sheetName, fields, rec, rowNum) {
+  const sh = sheet_(sheetName);
+  const header = headerRow_(sh);
+  const idx = headerIndex_(header);
+  if (!rowNum && !rec.id) rec.id = newId_();
+  const row = rowNum ? sh.getRange(rowNum, 1, 1, header.length).getValues()[0] : new Array(header.length).fill('');
+  fields.forEach(fd => {
+    const c = idx[fd.h];
+    if (c !== undefined && rec[fd.k] !== undefined) row[c] = rec[fd.k] === null ? '' : rec[fd.k];
+  });
+  if (rowNum) sh.getRange(rowNum, 1, 1, header.length).setValues([row]);
+  else sh.appendRow(row);
+}
+
+function deleteWhere_(sheetName, fields, pred) {
+  const sh = sheet_(sheetName);
+  readTable_(sheetName, fields).filter(pred).sort((a, b) => b._row - a._row).forEach(r => sh.deleteRow(r._row));
+}
+
+function updateWhere_(sheetName, fields, pred, upd) {
+  readTable_(sheetName, fields).filter(pred).forEach(r => writeRow_(sheetName, fields, Object.assign({}, upd), r._row));
+}
+
+function renameRelated_(recordId, name) {
+  updateWhere_(SHEETS.TASKS, TASK_FIELDS, t => String(t.recordId) === String(recordId), { recordName: name });
+  updateWhere_(SHEETS.ACTIVITIES, ACTIVITY_FIELDS, a => String(a.recordId) === String(recordId), { recordName: name });
+}
+
+function addActivity_(kind, recordId, recordName, date, type, summary, by) {
+  writeRow_(SHEETS.ACTIVITIES, ACTIVITY_FIELDS, {
+    id: newId_(), kind: kind, recordId: recordId, recordName: cleanText_(recordName), date: date,
+    type: type, summary: cleanText_(summary), by: cleanText_(by || ''), createdAt: new Date()
+  }, null);
+}
+
+function activitiesFor_(recordId) {
+  return readTable_(SHEETS.ACTIVITIES, ACTIVITY_FIELDS)
+    .filter(a => String(a.recordId) === String(recordId))
+    .sort((a, b) => (asDate_(b.date) || 0) - (asDate_(a.date) || 0));
+}
+
+function addTask_(t) {
+  writeRow_(SHEETS.TASKS, TASK_FIELDS, {
+    id: newId_(), title: cleanText_(t.title), due: asDate_(t.due) || '', owner: cleanText_(t.owner || ''),
+    status: 'Open', recordName: cleanText_(t.recordName || ''), kind: t.kind || '', recordId: t.recordId || '',
+    notes: cleanText_(t.notes || ''), createdAt: new Date()
+  }, null);
+}
+
+function findRecord_(kind, id) {
+  const ent = entity_(kind);
+  return readTable_(ent.sheet, ent.fields).find(r => String(r.id) === String(id)) || null;
+}
+
+function entity_(kind) {
+  const e = ENTITIES[kind];
+  if (!e) throw new Error('Unknown record type.');
+  return e;
+}
+
+function toClient_(fields, o) {
+  const r = {};
+  fields.forEach(fd => {
+    const v = o[fd.k];
+    if (fd.type === 'date' || fd.type === 'datetime' || fd.type === 'hidden-date') r[fd.k] = iso_(v);
+    else if (fd.type === 'number') r[fd.k] = v === '' || v === null || v === undefined || isNaN(Number(v)) ? '' : Number(v);
+    else if (v instanceof Date) r[fd.k] = v.toISOString();
+    else r[fd.k] = v === null || v === undefined ? '' : String(v);
+  });
+  return r;
+}
+
+function fromClient_(fields, input) {
+  const r = {};
+  fields.forEach(fd => {
+    if (fd.type === 'hidden' || fd.type === 'hidden-date') return;
+    if (!Object.prototype.hasOwnProperty.call(input, fd.k)) return;
+    const v = input[fd.k];
+    if (fd.type === 'date' || fd.type === 'datetime') r[fd.k] = asDate_(v) || '';
+    else if (fd.type === 'number') {
+      const n = Number(String(v === null || v === undefined ? '' : v).replace(/[^\d.\-]/g, ''));
+      r[fd.k] = v === '' || v === null || v === undefined || isNaN(n) ? '' : n;
+    }
+    else if (fd.type === 'checkbox') r[fd.k] = v === true || v === 'Yes' ? 'Yes' : 'No';
+    else if (fd.type === 'url') r[fd.k] = cleanText_(normalizeUrl_(v));
+    else r[fd.k] = cleanText_(v, fd.type);
+  });
+  return r;
+}
+
+function checkPin_(pin) {
+  const cache = CacheService.getScriptCache();
+  const fails = Number(cache.get('pinFails') || 0);
+  if (fails >= 20) throw new Error('Too many wrong PIN attempts. Try again in 10 minutes.');
+  const expected = getSetting_('Access PIN');
+  if (!expected || String(pin || '').trim() !== expected) {
+    cache.put('pinFails', String(fails + 1), 600);
+    throw new Error('Invalid PIN.');
+  }
+}
+
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(25000);
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+function sheet_(name) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!sh) throw new Error('Tab "' + name + '" not found. Run Lead Tracker → Run setup in the sheet.');
+  return sh;
+}
+
+function ensureSheet_(ss, name, headers) {
+  const sh = ss.getSheetByName(name) || ss.insertSheet(name);
+  const current = headerRow_(sh);
+  if (!current.filter(String).length) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  } else {
+    const missing = headers.filter(h => current.indexOf(h) === -1);
+    if (missing.length) sh.getRange(1, current.length + 1, 1, missing.length).setValues([missing]);
+  }
+  sh.getRange(1, 1, 1, sh.getLastColumn()).setFontWeight('bold').setBackground('#1f2937').setFontColor('#ffffff');
+  sh.setFrozenRows(1);
+  return sh;
+}
+
+function headerRow_(sh) {
+  const cols = sh.getLastColumn();
+  return cols ? sh.getRange(1, 1, 1, cols).getValues()[0].map(h => String(h).trim()) : [];
+}
+
+function headerIndex_(header) {
+  const idx = {};
+  header.forEach((h, i) => { if (h && idx[h] === undefined) idx[h] = i; });
+  return idx;
+}
+
+function setDropdown_(sh, col, list) {
+  if (col === undefined || !list) return;
+  const rule = SpreadsheetApp.newDataValidation().requireValueInList(list, true).setAllowInvalid(true).build();
+  sh.getRange(2, col + 1, sh.getMaxRows() - 1, 1).setDataValidation(rule);
+}
+
+function teamList_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEETS.TEAM);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const width = Math.max(3, sh.getLastColumn());
+  return sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues()
+    .map(r => ({ name: String(r[0]).trim(), email: String(r[1]).trim(), digest: String(r[2] || '').trim() }))
+    .filter(t => t.name && t.email.indexOf('@') > 0);
+}
+
+function recipientsFor_(r) {
+  const map = {};
+  teamList_().forEach(t => { map[t.name.toLowerCase()] = t.email; });
+  const team = [];
+  splitList_(r.recipients).forEach(n => {
+    const e = map[n.toLowerCase()];
+    if (e && team.indexOf(e) === -1) team.push(e);
+  });
+  const contact = r.remindContact === 'Yes' && String(r.email).indexOf('@') > 0 ? String(r.email).trim() : '';
+  return { team: team, contact: contact };
+}
+
+function settingsRows_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEETS.SETTINGS);
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
+}
+
+function hasSetting_(key) {
+  return settingsRows_().some(x => String(x[0]).trim().toLowerCase() === key.toLowerCase());
+}
+
+function getSetting_(key) {
+  const r = settingsRows_().find(x => String(x[0]).trim().toLowerCase() === key.toLowerCase());
+  return r ? String(r[1]).trim() : '';
+}
+
+function staleDays_() { return Number(getSetting_('Stale after (days)')) || 14; }
+function senderName_() { return getSetting_('Email sender name') || CONFIG.APP_TITLE; }
+function appUrl_() { try { return ScriptApp.getService().getUrl() || ''; } catch (e) { return ''; } }
+
+function log_(to, related, label, status) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEETS.LOG);
+  if (sh) sh.appendRow([new Date(), (to || []).join(', '), related, label, status]);
+}
+
+function countBy_(list, key, order) {
+  const counts = {};
+  list.forEach(r => { const v = String(r[key] || '').trim() || 'Not set'; counts[v] = (counts[v] || 0) + 1; });
+  const out = order.filter(o => counts[o]).map(o => [o, counts[o]]);
+  Object.keys(counts).filter(k => order.indexOf(k) === -1)
+    .sort((a, b) => counts[b] - counts[a])
+    .forEach(k => out.push([k, counts[k]]));
+  return out;
+}
+
+function newId_() { return Utilities.getUuid().replace(/-/g, '').slice(0, 10); }
+function splitList_(v) { return String(v || '').split(',').map(s => s.trim()).filter(Boolean); }
+function ymd_(d) { return Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd'); }
+
+function asDate_(v) {
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function iso_(v) { const d = asDate_(v); return d ? d.toISOString() : ''; }
+
+function waDigits_(v) {
+  let d = String(v || '').replace(/\D/g, '');
+  if (d.length === 10) d = '91' + d;          // Indian number without country code
+  return d.length >= 11 ? d : '';
+}
+
+function normalizeUrl_(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  return /^https?:\/\//i.test(s) ? s : 'https://' + s.replace(/^\/+/, '');
+}
+
+function cleanText_(v, type) {
+  if (v === null || v === undefined) return '';
+  let s = String(v).trim();
+  if (type === 'tel') return s.replace(/^=+/, '');         // phone column is plain text
+  if (/^[=+\-@]/.test(s)) s = "'" + s;                       // never let text become a formula
+  return s;
+}
+
+function fmt_(d) { return Utilities.formatDate(d, CONFIG.TIMEZONE, "EEE, d MMM yyyy 'at' h:mm a"); }
+
+function inWords_(meeting) {
+  const mins = Math.max(0, Math.round((meeting.getTime() - Date.now()) / 60000));
+  if (mins < 1) return 'now';
+  if (mins < 60) return 'in ' + mins + ' min';
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return 'in ' + h + ' hr' + (h > 1 ? 's' : '') + (m ? ' ' + m + ' min' : '');
+}
+
+function esc_(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function nl2br_(s) { return esc_(s).replace(/\n/g, '<br>'); }
